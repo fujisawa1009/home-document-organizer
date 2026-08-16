@@ -37,7 +37,7 @@ DOC_TYPE_KEYWORDS: dict[str, dict[str, list[str]]] = {
         "契約内容のお知らせ": ["ご契約内容のお知らせ", "契約内容のお知らせ"],
     },
     "身分証": {
-        "運転免許証": ["運転免許証"],
+        "運転免許証": ["運転免許証", "免許証"],
         "マイナンバーカード": ["マイナンバーカード", "個人番号カード"],
         "健康保険証": ["健康保険被保険者証", "健康保険証"],
         "パスポート": ["旅券", "パスポート"],
@@ -221,10 +221,17 @@ def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
 
     学習ルールは過去にCEOが承認した「発行元(判定)」をキーワードとして記憶したもの
     ＝人間確認済みの実例なので、確信度は無条件で「高」とする。
+
+    ファイル名（拡張子を除く部分）もOCR/テキスト抽出結果と合わせて判定材料にする。
+    免許証など「セキュリティ模様・反射・小さい文字」でOCR精度が特に厳しい書類は、
+    受信箱に入れる前にファイル名へ「免許証」等のヒントを入れてもらうことで、
+    OCRが失敗しても確実に分類できるようにするため（CEO確認2026-08-16）。
     """
     ext = path.suffix.lower()
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
-    text = extract.extract_text(path)
+    ocr_text = extract.extract_text(path)
+    # ファイル名を本文の先頭に足すだけ＝キーワード一致・学習ルール一致の両方に効く
+    text = f"{path.stem}\n{ocr_text}" if ocr_text else path.stem
 
     if root is not None:
         rule = learning.match(root, text)

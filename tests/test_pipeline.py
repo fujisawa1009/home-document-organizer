@@ -96,6 +96,7 @@ def test_archive_inbox_copies_without_touching_original(root: Path):
 
 def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyPatch):
     src = _put_inbox_file(root, "tax.pdf")
+    original_bytes = src.read_bytes()
 
     monkeypatch.setattr(
         classify,
@@ -123,6 +124,7 @@ def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyP
     results_before = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
     assert results_before == []
     assert not (root / config.CATEGORY_TAX / "20260810_納税証明書_麹町税務署.pdf").exists()
+    assert src.exists()  # 未承認の間は元ファイルにも一切触れない
 
     # Telegram/LINE等で承認が返ってきた想定＝CSVの承認列にOKを書き込む
     with csv_path.open(encoding="utf-8-sig") as f:
@@ -140,17 +142,51 @@ def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyP
     assert results[0].ok
     dest = Path(results[0].dest_path)
     assert dest == root / config.CATEGORY_TAX / "20260810_納税証明書_麹町税務署.pdf"
-    assert dest.read_bytes() == src.read_bytes()
+    assert dest.read_bytes() == original_bytes
 
-    # 元ファイル・受信箱は無傷（コピーのみ）
-    assert src.exists()
+    # CEO指示2026-08-16: コピー成功後は受信箱の元ファイルを自動削除する
+    # （`_元ファイル保管`に複製済みであることを確認したうえで削除）
+    assert results[0].deleted_source is True
+    assert not src.exists()
+    archived = list((root / config.ORIGINAL_ARCHIVE).glob("*_tax.pdf"))
+    assert len(archived) == 1
+    assert archived[0].read_bytes() == original_bytes  # バックアップは無傷
 
-    # 同じ承認済みCSVをもう一度適用しても上書きされず連番になる
+    # 元ファイルが既に無い状態で同じ承認済みCSVを再適用しても、クラッシュせず
+    # 「見つからない」失敗として記録される（再コピーはできない＝当然の帰結）
     results2 = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
-    assert results2[0].ok
-    dest2 = Path(results2[0].dest_path)
-    assert dest2 == root / config.CATEGORY_TAX / "20260810_納税証明書_麹町税務署_2.pdf"
-    assert dest.exists()  # 1回目の結果も消えていない
+    assert len(results2) == 1
+    assert results2[0].ok is False
+    assert "見つかりません" in results2[0].error
+    assert dest.exists()  # 1回目の結果は影響を受けない
+
+
+def test_apply_does_not_delete_source_when_not_archived(root: Path, monkeypatch: pytest.MonkeyPatch):
+    """apply前にscan-inboxを飛ばしていた（＝_元ファイル保管に複製が無い）場合は、
+    コピーは実行しても元ファイルの自動削除はスキップする（安全側フォールバック）。"""
+    src = _put_inbox_file(root, "tax.pdf")
+    # 意図的に archive_inbox を呼ばない＝_元ファイル保管に複製が存在しない状態を作る
+
+    monkeypatch.setattr(
+        classify,
+        "classify_file",
+        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
+    )
+    csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN)
+    with csv_path.open(encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows_data = list(reader)
+    rows_data[0]["承認"] = "OK"
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_data)
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+    assert results[0].ok
+    assert results[0].deleted_source is False
+    assert src.exists()  # 複製未確認のため削除されない
 
 
 def test_apply_rejects_unknown_target_folder(root: Path):

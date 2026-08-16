@@ -90,6 +90,34 @@ def test_identification_document():
     assert result.suggested_folder == config.CATEGORY_ID
 
 
+def test_classify_file_uses_filename_as_hint_when_ocr_is_garbled(tmp_path, monkeypatch):
+    """免許証はOCR精度が特に厳しく本文からキーワードを拾えないことがある。
+    受信箱に入れる前にファイル名へヒントを入れれば、OCRが失敗しても分類できること。"""
+    src = tmp_path / "免許証_表.jpg"
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "59% 10有 9日生\n06370\n9012118038",  # 実際のOCR結果を模した文字化け
+    )
+
+    result = classify_file(src)
+    assert result.category_key == "身分証"
+    assert result.doc_type == "運転免許証"
+    assert result.suggested_folder == config.CATEGORY_ID
+
+
+def test_classify_file_without_filename_hint_falls_back_to_needs_review(tmp_path, monkeypatch):
+    src = tmp_path / "IMG_6930.jpg"
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "59% 10有 9日生\n06370\n9012118038",
+    )
+    result = classify_file(src)
+    assert result.confidence == "低"
+    assert result.suggested_folder == config.NEEDS_REVIEW
+
+
 def test_classify_file_prefers_learned_rule_over_keyword_dictionary(tmp_path, monkeypatch):
     """dカードのような未知の書類でも、一度CEOが承認すれば次回から学習ルールで
     高確信度に分類されること（キーワード辞書の更新は不要）。"""

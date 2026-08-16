@@ -1,10 +1,12 @@
-"""第3・4段階: 承認後の実行（REQUIREMENTS.md 7-4）。
+"""第3・4段階: 承認後の実行（REQUIREMENTS.md 7-4・CEO指示2026-08-16で自動削除に変更）。
 
 - 「承認」列にOK等の記入がある行のみ処理対象。
-- 元ファイルは絶対に変更しない。新しいファイル名・カテゴリフォルダへ **コピー** で複製するのみ。
-- 同名衝突は上書きせず連番付与（naming.safe_copy が保証）。
-- 受信箱の元ファイル削除は本モジュールの範囲外（絶対に自動実行しない。REQUIREMENTS.md 11章の
-  CEO確認事項どおり、削除の是非は毎回別途確認する運用＝ cleanup_inbox.py が対話的に扱う）。
+- 分類フォルダへは **コピー** で複製する（同名衝突は上書きせず連番付与＝naming.safe_copy が保証）。
+- 受信箱の元ファイルは、コピー成功後に**自動削除する**（CEO指示2026-08-16「コピー先へ移動したら
+  自動的に元ファイルを削除したい」）。以前は毎回都度確認だったが、この指示で運用変更。
+  ただし絶対原則1の精神（バックアップ無しに消さない）は維持し、`_元ファイル保管`に複製済みで
+  あることを確認できた場合のみ削除する（cleanup_inbox.is_archived と同じ判定を使う）。
+  複製の確認が取れない場合は削除せずログに理由を残し、そのまま受信箱に残す（安全側）。
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import config, extract, learning, logger
+from . import cleanup_inbox, config, extract, learning, logger
 from .naming import safe_copy
 from .proposal import CSV_COLUMNS
 
@@ -34,6 +36,7 @@ class ApplyResult:
     ok: bool
     dest_path: str = ""
     error: str = ""
+    deleted_source: bool = False
 
 
 def is_approved(value: str) -> bool:
@@ -121,6 +124,53 @@ def apply_approved_changes(
         logger.log_operation(
             root, logger.OP_RENAME_EXEC, str(resolved_src), str(dest), logger.RESULT_OK, when=when
         )
-        results.append(ApplyResult(row_index=i, source_path=str(resolved_src), ok=True, dest_path=str(dest)))
+
+        deleted_source = _delete_source_after_copy(root, resolved_src, when=when)
+        results.append(
+            ApplyResult(
+                row_index=i,
+                source_path=str(resolved_src),
+                ok=True,
+                dest_path=str(dest),
+                deleted_source=deleted_source,
+            )
+        )
 
     return results
+
+
+def _delete_source_after_copy(root: Path, src: Path, when: datetime) -> bool:
+    """コピー成功直後に受信箱の元ファイルを自動削除する（CEO指示2026-08-16）。
+
+    `_元ファイル保管` に複製済みであることを確認できた場合のみ削除する。確認できない
+    場合は削除せず理由をログに残す（絶対原則1の精神＝バックアップ無しに消さない、は維持）。
+    削除自体の失敗はコピーの成功結果には影響させない（apply全体は成功扱いのまま）。
+    """
+    if not cleanup_inbox.is_archived(root, src):
+        logger.log_operation(
+            root,
+            logger.OP_INBOX_DELETE,
+            str(src),
+            "",
+            logger.RESULT_NG,
+            detail="_元ファイル保管に複製が確認できないため自動削除をスキップ（受信箱に残置）",
+            when=when,
+        )
+        return False
+    try:
+        src.unlink()
+    except OSError as exc:
+        logger.log_operation(
+            root, logger.OP_INBOX_DELETE, str(src), "", logger.RESULT_NG, detail=str(exc), when=when
+        )
+        return False
+    logger.log_operation(
+        root,
+        logger.OP_INBOX_DELETE,
+        str(src),
+        "",
+        logger.RESULT_OK,
+        detail="apply成功後の自動削除（_元ファイル保管に複製済みを確認済み）",
+        when=when,
+    )
+    return True
