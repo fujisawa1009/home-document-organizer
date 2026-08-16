@@ -41,7 +41,7 @@ class ProposalRow:
     confidence: str
     reason: str
 
-    def to_csv_row(self) -> list[str]:
+    def to_csv_row(self, auto_approve: bool = False) -> list[str]:
         return [
             self.source_name,
             self.source_path,
@@ -51,39 +51,42 @@ class ProposalRow:
             self.issuer,
             self.doc_date,
             self.confidence,
-            "",  # 承認: 空欄（人間 or 承認チャネルが記入）
+            "OK" if auto_approve else "",  # 承認: 手動時は空欄／自動運転時はOKを直接記入
             self.reason,
         ]
 
 
-def _classify_safely(root: Path, src: Path) -> classify.ClassificationResult:
+def _classify_safely(root: Path, src: Path, when: datetime) -> classify.ClassificationResult:
     """classify_file の例外で propose 全体を止めない（8章）。
 
     失敗は _要確認 へ倒しつつ、CSVの備考だけでなく操作ログにも残す
     （7-5「分類エラー」は本来ここで記録されるべき失敗種別）。
+    `when` は呼び出し元(generate_proposal_csv)と同じ値を使う＝同一実行のログが
+    日付境界をまたいで別日のログファイルに分散しないようにするため。
     """
     try:
         return classify.classify_file(src, root=root)
     except Exception as exc:  # noqa: BLE001 - 1ファイルの想定外失敗で全体を止めない
         logger.log_operation(
-            root, logger.OP_CLASSIFY_ERROR, str(src), "", logger.RESULT_NG, detail=str(exc)
+            root, logger.OP_CLASSIFY_ERROR, str(src), "", logger.RESULT_NG, detail=str(exc), when=when
         )
         return classify.ClassificationResult(
             category_key="",
             suggested_folder=config.NEEDS_REVIEW,
             doc_type="不明",
             issuer="不明",
-            date_str=datetime.now().strftime("%Y%m%d"),
+            date_str=when.strftime("%Y%m%d"),
             estimated_date=True,
             confidence="低",
             reason=f"分類処理で例外が発生: {exc}",
         )
 
 
-def build_proposal_rows(root: Path) -> list[ProposalRow]:
+def build_proposal_rows(root: Path, when: datetime | None = None) -> list[ProposalRow]:
+    when = when or datetime.now()
     rows: list[ProposalRow] = []
     for src in list_inbox_files(root):
-        result = _classify_safely(root, src)
+        result = _classify_safely(root, src, when)
         new_filename = build_filename(
             result.date_str, result.doc_type, result.issuer, src.suffix, result.estimated_date
         )
@@ -106,7 +109,9 @@ def build_proposal_rows(root: Path) -> list[ProposalRow]:
     return rows
 
 
-def write_proposal_csv(root: Path, rows: list[ProposalRow], when: datetime | None = None) -> Path:
+def write_proposal_csv(
+    root: Path, rows: list[ProposalRow], when: datetime | None = None, auto_approve: bool = False
+) -> Path:
     when = when or datetime.now()
     proposal_dir = config.folder_path(root, config.PROPOSALS)
     proposal_dir.mkdir(parents=True, exist_ok=True)
@@ -117,7 +122,7 @@ def write_proposal_csv(root: Path, rows: list[ProposalRow], when: datetime | Non
         writer = csv.writer(f)
         writer.writerow(CSV_COLUMNS)
         for row in rows:
-            writer.writerow(row.to_csv_row())
+            writer.writerow(row.to_csv_row(auto_approve=auto_approve))
 
     logger.log_operation(
         root,
@@ -125,14 +130,24 @@ def write_proposal_csv(root: Path, rows: list[ProposalRow], when: datetime | Non
         "",
         str(path),
         logger.RESULT_OK,
-        detail=f"{len(rows)}件の変更案を作成",
+        detail=f"{len(rows)}件の変更案を作成" + ("（自動承認モード）" if auto_approve else ""),
         when=when,
     )
     return path
 
 
-def generate_proposal_csv(root: Path, when: datetime | None = None) -> tuple[Path, list[ProposalRow]]:
-    """受信箱を分類し `_変更案/変更案_YYYYMMDD_HHMMSS.csv` を書き出す。"""
-    rows = build_proposal_rows(root)
-    path = write_proposal_csv(root, rows, when=when)
+def generate_proposal_csv(
+    root: Path, when: datetime | None = None, auto_approve: bool = False
+) -> tuple[Path, list[ProposalRow]]:
+    """受信箱を分類し `_変更案/変更案_YYYYMMDD_HHMMSS.csv` を書き出す。
+
+    auto_approve=True の場合、確信度に関わらず全行を「承認」列にOKを入れた状態で
+    書き出す（CEO指示2026-08-16: 外出先からの自動振り分け運用のため。`_要確認`行きの
+    低確信度な書類も対象＝無理な分類ではなく「_要確認へ retreat」自体は自動で行ってよい
+    という判断）。実際のコピー実行には別途 apply_approved_changes の呼び出しが必要
+    （このモジュールはCSV生成のみ）。
+    """
+    when = when or datetime.now()
+    rows = build_proposal_rows(root, when=when)
+    path = write_proposal_csv(root, rows, when=when, auto_approve=auto_approve)
     return path, rows

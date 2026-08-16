@@ -42,6 +42,7 @@ DOC_TYPE_KEYWORDS: dict[str, dict[str, list[str]]] = {
         "健康保険証": ["健康保険被保険者証", "健康保険証"],
         "パスポート": ["旅券", "パスポート"],
         "住民票": ["住民票の写し", "住民票"],
+        "証明写真": ["証明写真"],
     },
 }
 
@@ -222,16 +223,21 @@ def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
     学習ルールは過去にCEOが承認した「発行元(判定)」をキーワードとして記憶したもの
     ＝人間確認済みの実例なので、確信度は無条件で「高」とする。
 
-    ファイル名（拡張子を除く部分）もOCR/テキスト抽出結果と合わせて判定材料にする。
-    免許証など「セキュリティ模様・反射・小さい文字」でOCR精度が特に厳しい書類は、
-    受信箱に入れる前にファイル名へ「免許証」等のヒントを入れてもらうことで、
-    OCRが失敗しても確実に分類できるようにするため（CEO確認2026-08-16）。
+    ファイル名（拡張子を除く部分）・受信箱直下のサブフォルダ名も、OCR/テキスト抽出結果と
+    合わせて判定材料にする。免許証など「セキュリティ模様・反射・小さい文字」でOCR精度が
+    特に厳しい書類は、受信箱に入れる前にファイル名やサブフォルダ名へ「免許証」等の
+    ヒントを入れてもらうことで、OCRが失敗しても確実に分類できるようにするため
+    （CEO確認2026-08-16）。例: `00_受信箱/01_証明写真/IMG_1234.jpg` なら
+    「01_証明写真」もヒントとして使われる。
     """
     ext = path.suffix.lower()
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     ocr_text = extract.extract_text(path)
-    # ファイル名を本文の先頭に足すだけ＝キーワード一致・学習ルール一致の両方に効く
-    text = f"{path.stem}\n{ocr_text}" if ocr_text else path.stem
+
+    hints = [path.stem]
+    if path.parent.name and path.parent.name != config.INBOX:
+        hints.insert(0, path.parent.name)  # サブフォルダ名（あれば）を最優先ヒントにする
+    text = "\n".join(hints + ([ocr_text] if ocr_text else []))
 
     if root is not None:
         rule = learning.match(root, text)

@@ -6,6 +6,7 @@
   python -m home_doc_organizer propose
   python -m home_doc_organizer apply --csv "_変更案/変更案_20260816_120000.csv"
   python -m home_doc_organizer cleanup-inbox
+  python -m home_doc_organizer auto-run   # scan-inbox+propose+applyを無人実行（CEO指示2026-08-16）
 """
 
 from __future__ import annotations
@@ -81,6 +82,38 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_auto_run(args: argparse.Namespace) -> int:
+    """scan-inbox → propose(全行自動承認) → apply を無人で一気通貫実行する。
+
+    CEO指示2026-08-16: 外出先からiPhoneで撮影→該当フォルダに配置→帰宅を待たず自動振り分け
+    したい、との要望に対応。確信度に関わらず自動実行する（低確信度は_要確認へ retreat
+    すること自体が「無理な分類をしない」安全策であり、それをコピーすること自体は問題ない）。
+    承認プロセスを経ないため、実行結果は必ず呼び出し側（launchdラッパー）で通知すること。
+    """
+    root = config.get_root(args.root)
+
+    scan_results = archive_inbox(root)
+    if not scan_results:
+        print("受信箱に新規ファイルなし。何もしません。")
+        return 0
+
+    csv_path, rows = generate_proposal_csv(root, auto_approve=True)
+    print(f"変更案CSVを作成（自動承認）: {csv_path}")
+    print(f"件数: {len(rows)}")
+
+    results = apply_approved_changes(root, csv_path=csv_path)
+    ok = sum(1 for r in results if r.ok)
+    ng = len(results) - ok
+    print(f"自動実行完了: {len(results)}件（成功{ok}件 / 失敗{ng}件）")
+    for r in results:
+        if r.ok:
+            deleted = "元ファイル削除済" if r.deleted_source else "元ファイルは受信箱に残置"
+            print(f"  [OK] {r.source_path} → {r.dest_path}（{deleted}）")
+        else:
+            print(f"  [NG] {r.source_path}: {r.error}")
+    return 0
+
+
 def cmd_cleanup_inbox(args: argparse.Namespace) -> int:
     root = config.get_root(args.root)
     results = cleanup_inbox(root)
@@ -116,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_cleanup = sub.add_parser("cleanup-inbox", help="保管済み受信箱ファイルの削除（1件ずつ対話確認）")
     _add_root_arg(p_cleanup)
     p_cleanup.set_defaults(func=cmd_cleanup_inbox)
+
+    p_auto = sub.add_parser(
+        "auto-run", help="無人実行: scan-inbox+propose(自動承認)+applyを一括実行（launchd用）"
+    )
+    _add_root_arg(p_auto)
+    p_auto.set_defaults(func=cmd_auto_run)
 
     return parser
 

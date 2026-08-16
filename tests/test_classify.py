@@ -106,6 +106,24 @@ def test_classify_file_uses_filename_as_hint_when_ocr_is_garbled(tmp_path, monke
     assert result.suggested_folder == config.CATEGORY_ID
 
 
+def test_classify_file_uses_subfolder_name_as_hint(tmp_path, monkeypatch):
+    """00_受信箱/01_証明写真/IMG_1234.jpg のように、受信箱直下のサブフォルダ名も
+    分類ヒントとして使われること（CEO指示2026-08-16）。"""
+    subdir = tmp_path / "01_証明写真"
+    subdir.mkdir()
+    src = subdir / "IMG_1234.jpg"
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "",  # OCRは何も拾えない想定（写真のみ・文字なし）
+    )
+
+    result = classify_file(src)
+    assert result.category_key == "身分証"
+    assert result.doc_type == "証明写真"
+    assert result.suggested_folder == config.CATEGORY_ID
+
+
 def test_classify_file_without_filename_hint_falls_back_to_needs_review(tmp_path, monkeypatch):
     src = tmp_path / "IMG_6930.jpg"
     src.write_bytes(b"dummy")

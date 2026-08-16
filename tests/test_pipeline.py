@@ -15,7 +15,7 @@ import pytest
 from home_doc_organizer import classify, config
 from home_doc_organizer.apply_changes import apply_approved_changes
 from home_doc_organizer.cleanup_inbox import cleanup_inbox
-from home_doc_organizer.inbox_scan import archive_inbox
+from home_doc_organizer.inbox_scan import archive_inbox, list_inbox_files
 from home_doc_organizer.init_folders import init_folders
 from home_doc_organizer.proposal import CSV_COLUMNS, generate_proposal_csv
 
@@ -31,6 +31,16 @@ def root(tmp_path: Path) -> Path:
 
 def _put_inbox_file(root: Path, name: str, content: bytes = b"dummy-pdf-bytes") -> Path:
     p = config.folder_path(root, config.INBOX) / name
+    p.write_bytes(content)
+    return p
+
+
+def _put_inbox_subfolder_file(
+    root: Path, subfolder: str, name: str, content: bytes = b"dummy-pdf-bytes"
+) -> Path:
+    d = config.folder_path(root, config.INBOX) / subfolder
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / name
     p.write_bytes(content)
     return p
 
@@ -92,6 +102,36 @@ def test_archive_inbox_copies_without_touching_original(root: Path):
     ]
     assert rows[1][1] == "元ファイル保管コピー"
     assert rows[1][4] == "成功"
+
+
+def test_list_inbox_files_includes_one_level_subfolder(root: Path):
+    """CEO指示2026-08-16: フォルダ名で書類種別を示せるよう、1階層のサブフォルダの
+    中身も受信箱スキャン対象にする（例: 00_受信箱/01_証明写真/写真.jpg）。"""
+    top = _put_inbox_file(root, "top.pdf")
+    nested = _put_inbox_subfolder_file(root, "01_証明写真", "photo.jpg")
+    # 隠しファイル・隠しフォルダ内は対象外のまま
+    _put_inbox_file(root, ".DS_Store")
+    (config.folder_path(root, config.INBOX) / "01_証明写真" / ".DS_Store").write_bytes(b"x")
+    # 2階層目は対象外（1階層までのスコープ限定）
+    deep_dir = config.folder_path(root, config.INBOX) / "01_証明写真" / "さらに下"
+    deep_dir.mkdir(parents=True)
+    (deep_dir / "deep.jpg").write_bytes(b"x")
+
+    found = list_inbox_files(root)
+
+    assert set(found) == {top, nested}
+
+
+def test_archive_inbox_handles_subfolder_file(root: Path):
+    nested = _put_inbox_subfolder_file(root, "01_証明写真", "photo.jpg")
+    original_bytes = nested.read_bytes()
+
+    results = archive_inbox(root, when=FIXED_WHEN)
+
+    assert len(results) == 1
+    assert results[0].ok
+    assert results[0].archived_to.read_bytes() == original_bytes
+    assert nested.exists()  # 元ファイルは無傷
 
 
 def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyPatch):
@@ -397,3 +437,74 @@ def test_propose_survives_one_file_raising_during_classification(root: Path, mon
     with log_path.open(encoding="utf-8-sig") as f:
         log_rows = list(csv.reader(f))
     assert any(r[1] == "分類エラー" for r in log_rows[1:])
+
+
+def test_generate_proposal_csv_auto_approve_writes_ok_for_every_row(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _put_inbox_file(root, "high.pdf")
+    _put_inbox_file(root, "unknown.pdf")
+
+    def fake_classify(path: Path, root=None):
+        if path.name == "high.pdf":
+            return _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署")
+        return classify.ClassificationResult(
+            category_key="",
+            suggested_folder=config.NEEDS_REVIEW,
+            doc_type="不明",
+            issuer="不明",
+            date_str="20260101",
+            estimated_date=True,
+            confidence="低",
+            reason="キーワード一致なし",
+        )
+
+    monkeypatch.setattr(classify, "classify_file", fake_classify)
+
+    csv_path, rows = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+    assert len(rows) == 2
+    with csv_path.open(encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        approvals = [r["承認"] for r in reader]
+    assert approvals == ["OK", "OK"]  # 確信度に関わらず全行OK
+
+
+def test_auto_run_flow_files_everything_including_low_confidence(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """CEO指示2026-08-16: 外出先からの自動振り分け。確信度が低い書類も
+    _要確認へ自動でコピーされ、受信箱の元ファイルは自動削除されること。"""
+    _put_inbox_file(root, "tax.pdf")
+    _put_inbox_file(root, "mystery.pdf")
+
+    def fake_classify(path: Path, root=None):
+        if path.name == "tax.pdf":
+            return _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署")
+        return classify.ClassificationResult(
+            category_key="",
+            suggested_folder=config.NEEDS_REVIEW,
+            doc_type="不明",
+            issuer="不明",
+            date_str="20260101",
+            estimated_date=True,
+            confidence="低",
+            reason="キーワード一致なし",
+        )
+
+    monkeypatch.setattr(classify, "classify_file", fake_classify)
+
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+    assert len(results) == 2
+    assert all(r.ok for r in results)
+    assert all(r.deleted_source for r in results)
+
+    assert (root / config.CATEGORY_TAX / "20260810_納税証明書_税務署.pdf").exists()
+    needs_review_files = list((root / config.NEEDS_REVIEW).iterdir())
+    assert len(needs_review_files) == 1  # 低確信度でも_要確認へ自動でコピーされる
+
+    # 受信箱は空になっている（自動削除・サブフォルダ含め対象外の隠しファイルのみ許容）
+    remaining = [p for p in config.folder_path(root, config.INBOX).iterdir() if not p.name.startswith(".")]
+    assert remaining == []
