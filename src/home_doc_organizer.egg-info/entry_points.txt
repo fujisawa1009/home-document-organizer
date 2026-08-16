@@ -1,0 +1,2 @@
+[console_scripts]
+home-doc-organizer = home_doc_organizer.cli:main

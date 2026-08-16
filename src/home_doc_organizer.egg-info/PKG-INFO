@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: home-doc-organizer
+Version: 0.1.0
+Summary: 家庭書類自動整理システム（プロトタイプ・第1〜4段階）
+Requires-Python: >=3.10
+Requires-Dist: pypdf>=4.0
+Provides-Extra: ocr
+Requires-Dist: pillow>=10.0; extra == "ocr"
+Requires-Dist: pillow-heif>=0.15; extra == "ocr"
+Requires-Dist: pytesseract>=0.3.10; extra == "ocr"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: reportlab>=4.0; extra == "dev"

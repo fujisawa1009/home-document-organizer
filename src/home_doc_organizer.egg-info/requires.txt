@@ -1,0 +1,10 @@
+pypdf>=4.0
+
+[dev]
+pytest>=8.0
+reportlab>=4.0
+
+[ocr]
+pillow>=10.0
+pillow-heif>=0.15
+pytesseract>=0.3.10
