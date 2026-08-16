@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import config, extract
+from . import config, extract, learning
 
 # category_key -> { 書類種別ラベル: [キーワード...] }
 DOC_TYPE_KEYWORDS: dict[str, dict[str, list[str]]] = {
@@ -202,8 +202,33 @@ def classify_document(text: str, ext: str, mtime: datetime) -> ClassificationRes
     )
 
 
-def classify_file(path: Path) -> ClassificationResult:
+def _from_learned_rule(rule: dict, mtime: datetime) -> ClassificationResult:
+    category_key = rule["category_key"]
+    return ClassificationResult(
+        category_key=category_key,
+        suggested_folder=config.CATEGORY_KEY_TO_FOLDER[category_key],
+        doc_type=rule.get("doc_type") or "不明",
+        issuer=rule.get("issuer") or "不明",
+        date_str=mtime.strftime("%Y%m%d"),
+        estimated_date=True,  # 学習ルールは日付までは覚えない（更新日時を採用）
+        confidence="高",
+        reason=f"学習済みルールに一致（キーワード: {rule['keyword']!r}）",
+    )
+
+
+def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
+    """root を渡すと、キーワード辞書より先に学習済みルール（learning.py）を試す。
+
+    学習ルールは過去にCEOが承認した「発行元(判定)」をキーワードとして記憶したもの
+    ＝人間確認済みの実例なので、確信度は無条件で「高」とする。
+    """
     ext = path.suffix.lower()
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
     text = extract.extract_text(path)
+
+    if root is not None:
+        rule = learning.match(root, text)
+        if rule is not None:
+            return _from_learned_rule(rule, mtime)
+
     return classify_document(text, ext, mtime)

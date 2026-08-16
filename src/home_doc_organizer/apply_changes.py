@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import config, logger
+from . import config, extract, learning, logger
 from .naming import safe_copy
 from .proposal import CSV_COLUMNS
 
@@ -101,6 +101,14 @@ def apply_approved_changes(
 
             dest_dir = config.folder_path(root, target_folder)
             dest = safe_copy(resolved_src, dest_dir, filename)
+
+            # 学習: CEOが承認した分類結果を今後のために記憶する（失敗しても実行結果には
+            # 影響させない＝コピー自体は既に成功しているため）。
+            try:
+                source_text = extract.extract_text(resolved_src)
+                learning.learn_from_applied_row(root, row, source_text)
+            except Exception:  # noqa: BLE001 - 学習は付随機能。失敗してもapply自体は成功扱い
+                pass
         except (OSError, ValueError, KeyError) as exc:
             # KeyError=CSV列欠落、ValueError=カテゴリ/パス不正、OSError=I/O失敗。
             # いずれも1行の失敗でバッチ全体を止めない（8章）。

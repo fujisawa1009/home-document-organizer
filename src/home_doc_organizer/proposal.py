@@ -63,7 +63,7 @@ def _classify_safely(root: Path, src: Path) -> classify.ClassificationResult:
     （7-5「分類エラー」は本来ここで記録されるべき失敗種別）。
     """
     try:
-        return classify.classify_file(src)
+        return classify.classify_file(src, root=root)
     except Exception as exc:  # noqa: BLE001 - 1ファイルの想定外失敗で全体を止めない
         logger.log_operation(
             root, logger.OP_CLASSIFY_ERROR, str(src), "", logger.RESULT_NG, detail=str(exc)

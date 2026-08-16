@@ -1,7 +1,9 @@
 from datetime import datetime
+from pathlib import Path
 
-from home_doc_organizer import config
-from home_doc_organizer.classify import classify_document
+from home_doc_organizer import config, learning
+from home_doc_organizer.classify import classify_document, classify_file
+from home_doc_organizer.init_folders import init_folders
 
 
 FIXED_MTIME = datetime(2026, 1, 1)
@@ -86,3 +88,36 @@ def test_identification_document():
     assert result.category_key == "身分証"
     assert result.doc_type == "運転免許証"
     assert result.suggested_folder == config.CATEGORY_ID
+
+
+def test_classify_file_prefers_learned_rule_over_keyword_dictionary(tmp_path, monkeypatch):
+    """dカードのような未知の書類でも、一度CEOが承認すれば次回から学習ルールで
+    高確信度に分類されること（キーワード辞書の更新は不要）。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    learning.save_rule(root, keyword="dカード", category_key="銀行", doc_type="クレジットカード", issuer="dカード")
+
+    src = tmp_path / "card.pdf"
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "d POINT CARD ... dカードのご利用明細",
+    )
+
+    result = classify_file(src, root=root)
+    assert result.category_key == "銀行"
+    assert result.doc_type == "クレジットカード"
+    assert result.issuer == "dカード"
+    assert result.confidence == "高"
+    assert "学習済みルール" in result.reason
+
+
+def test_classify_file_without_root_ignores_learning(tmp_path, monkeypatch):
+    src = tmp_path / "card.pdf"
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "d POINT CARD dカード会員 YUTA FUJISAWA 1234 5678 9012 3456",
+    )
+    result = classify_file(src)  # root省略＝学習ルールを見ない
+    assert result.confidence == "低"  # どのキーワード辞書にも一致しないため要確認

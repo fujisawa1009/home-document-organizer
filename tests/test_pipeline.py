@@ -100,7 +100,7 @@ def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         classify,
         "classify_file",
-        lambda path: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
+        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
     )
 
     archive_inbox(root, when=FIXED_WHEN)
@@ -242,7 +242,7 @@ def test_apply_logs_skip_for_unapproved_rows(root: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(
         classify,
         "classify_file",
-        lambda path: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署"),
+        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署"),
     )
     archive_inbox(root, when=FIXED_WHEN)
     csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN)  # 承認列は空欄のまま
@@ -287,11 +287,63 @@ def test_apply_rejects_source_path_outside_inbox(root: Path, tmp_path: Path):
     assert not (root / config.CATEGORY_TAX / "stolen.pdf").exists()
 
 
+def test_learning_loop_end_to_end(root: Path, monkeypatch: pytest.MonkeyPatch):
+    """CEOが一度だけ手直しして承認すると、同じ発行元の次のファイルは
+    キーワード辞書の更新なしで自動的に高確信度分類されるようになること。"""
+    # 既存キーワード辞書に一切ヒットしない文言にする（学習前は必ず低確信度になることの
+    # 前提を守るため。「ご利用明細」等は銀行の取引明細書キーワードと衝突するので避ける）。
+    ocr_text = "d POINT CARD dカード会員 YUTA FUJISAWA 1234 5678 9012 3456"
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: ocr_text)
+
+    # 1回目: 受信箱にdカードを入れて propose すると、キーワード辞書に無いので要確認
+    _put_inbox_file(root, "card1.pdf")
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path, rows = generate_proposal_csv(root, when=FIXED_WHEN)
+    assert rows[0].confidence == "低"
+    assert rows[0].suggested_category == config.NEEDS_REVIEW
+
+    # CEOがCSVを訂正してから承認（発行元(判定)はOCR本文に実在する文字列にする）
+    with csv_path.open(encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows_data = list(reader)
+    rows_data[0]["提案カテゴリ"] = config.CATEGORY_BANK
+    rows_data[0]["書類種別(判定)"] = "クレジットカード"
+    rows_data[0]["発行元(判定)"] = "dカード"
+    rows_data[0]["提案新ファイル名"] = "20260810_クレジットカード_dカード.pdf"
+    rows_data[0]["承認"] = "OK"
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_data)
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+    assert results[0].ok
+    assert (root / config.CATEGORY_BANK / "20260810_クレジットカード_dカード.pdf").exists()
+
+    # 学習ルールが1件保存されていること
+    from home_doc_organizer import learning
+
+    saved = learning.load_rules(root)
+    assert len(saved) == 1
+    assert saved[0]["issuer"] == "dカード"
+
+    # 2回目: 別のdカード書類を入れると、今度は自動で高確信度・銀行フォルダ提案になる
+    _put_inbox_file(root, "card2.pdf")
+    archive_inbox(root, when=FIXED_WHEN)
+    _, rows2 = generate_proposal_csv(root, when=FIXED_WHEN)
+    card2_row = next(r for r in rows2 if r.source_name == "card2.pdf")
+    assert card2_row.confidence == "高"
+    assert card2_row.suggested_category == config.CATEGORY_BANK
+    assert card2_row.doc_type == "クレジットカード"
+    assert "学習済みルール" in card2_row.reason
+
+
 def test_propose_survives_one_file_raising_during_classification(root: Path, monkeypatch: pytest.MonkeyPatch):
     _put_inbox_file(root, "broken.pdf")
     _put_inbox_file(root, "ok.pdf")
 
-    def flaky_classify(path: Path):
+    def flaky_classify(path: Path, root=None):
         if path.name == "broken.pdf":
             raise RuntimeError("破損PDFの読み取りに失敗")
         return _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署")

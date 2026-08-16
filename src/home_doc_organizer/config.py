@@ -28,6 +28,7 @@ NEEDS_REVIEW = "_要確認"
 ORIGINAL_ARCHIVE = "_元ファイル保管"
 PROPOSALS = "_変更案"
 LOGS = "_ログ"
+LEARNING = "_学習データ"
 
 CATEGORY_FOLDERS = (
     CATEGORY_TAX,
@@ -44,9 +45,10 @@ ALL_FOLDERS = (
     ORIGINAL_ARCHIVE,
     PROPOSALS,
     LOGS,
+    LEARNING,
 )
 
-# 分類キー（categorize.py の判定結果）→ 実フォルダ名
+# 分類キー（classify.py の判定結果）→ 実フォルダ名
 CATEGORY_KEY_TO_FOLDER = {
     "税金": CATEGORY_TAX,
     "銀行": CATEGORY_BANK,
@@ -54,6 +56,10 @@ CATEGORY_KEY_TO_FOLDER = {
     "身分証": CATEGORY_ID,
     "その他": CATEGORY_OTHER,
 }
+
+# 逆引き（実フォルダ名 → 分類キー）。学習機能が「承認された提案カテゴリ」から
+# category_key を復元するために使う。
+FOLDER_TO_CATEGORY_KEY = {v: k for k, v in CATEGORY_KEY_TO_FOLDER.items()}
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".heic"}
 
