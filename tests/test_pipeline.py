@@ -508,3 +508,26 @@ def test_auto_run_flow_files_everything_including_low_confidence(
     # 受信箱は空になっている（自動削除・サブフォルダ含め対象外の隠しファイルのみ許容）
     remaining = [p for p in config.folder_path(root, config.INBOX).iterdir() if not p.name.startswith(".")]
     assert remaining == []
+
+
+def test_auto_run_files_payslip_into_payroll_category(root: Path, monkeypatch: pytest.MonkeyPatch):
+    """給与明細が `06_給与` へ実際にコピーされること（apply_changes の許可フォルダにも
+    新カテゴリが含まれている＝カテゴリ追加が最後のコピー段まで通ること）。
+    2026-09-29 に `01_税金/住民税決定通知書` と `_要確認` へ誤分類された件の再発防止。"""
+    _put_inbox_file(root, "202601月給与.pdf")
+
+    # OCRが1文字も返さないスキャンPDFを模す（実物10件のうち9件がこの状態）。
+    # ファイル名ヒントだけで給与カテゴリへ入ることを、本物の分類器で確認する。
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: "")
+
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path, rows = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+    assert rows[0].suggested_category == config.CATEGORY_PAYROLL
+    # 日付欄は「支給年月のみ・日は01固定」と注記され、実在の1日付と誤読されないこと
+    assert "支給年月のみ" in rows[0].doc_date
+    assert len(results) == 1 and results[0].ok
+    assert (root / config.CATEGORY_PAYROLL / "20260101_給与明細_不明.pdf").exists()
+    assert list((root / config.NEEDS_REVIEW).iterdir()) == []
+    assert list((root / config.CATEGORY_TAX).iterdir()) == []

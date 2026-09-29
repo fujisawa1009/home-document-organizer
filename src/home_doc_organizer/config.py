@@ -24,6 +24,12 @@ CATEGORY_BANK = "02_銀行"
 CATEGORY_INSURANCE = "03_保険"
 CATEGORY_ID = "04_身分証"
 CATEGORY_OTHER = "05_その他"
+# 給与明細・賞与明細の専用カテゴリ。既存カテゴリはすべて「連番_名称」のトップレベル
+# フォルダ1階層で、apply_changes はカテゴリフォルダ直下へコピーする設計（入れ子の
+# サブフォルダはカテゴリモデルに存在しない）。そのため 05_その他 配下ではなく
+# 同じ並びのトップレベルとして新設する。既存フォルダには触らない冪等な追加
+# （init_folders が存在しないものだけ作る／safe_copy も書き込み時に mkdir する）。
+CATEGORY_PAYROLL = "06_給与"
 NEEDS_REVIEW = "_要確認"
 ORIGINAL_ARCHIVE = "_元ファイル保管"
 PROPOSALS = "_変更案"
@@ -36,6 +42,7 @@ CATEGORY_FOLDERS = (
     CATEGORY_INSURANCE,
     CATEGORY_ID,
     CATEGORY_OTHER,
+    CATEGORY_PAYROLL,
 )
 
 ALL_FOLDERS = (
@@ -55,6 +62,7 @@ CATEGORY_KEY_TO_FOLDER = {
     "保険": CATEGORY_INSURANCE,
     "身分証": CATEGORY_ID,
     "その他": CATEGORY_OTHER,
+    "給与": CATEGORY_PAYROLL,
 }
 
 # 逆引き（実フォルダ名 → 分類キー）。学習機能が「承認された提案カテゴリ」から

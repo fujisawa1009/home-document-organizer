@@ -79,6 +79,7 @@ def _classify_safely(root: Path, src: Path, when: datetime) -> classify.Classifi
             estimated_date=True,
             confidence="低",
             reason=f"分類処理で例外が発生: {exc}",
+            date_precision="mtime",
         )
 
 
@@ -93,6 +94,10 @@ def build_proposal_rows(root: Path, when: datetime | None = None) -> list[Propos
         doc_date_display = f"{result.date_str[:4]}-{result.date_str[4:6]}-{result.date_str[6:8]}"
         if result.estimated_date:
             doc_date_display += "（推定・更新日時）"
+        elif result.date_precision == "month":
+            # 給与・賞与明細のように月単位の書類は日を持たない。日付欄が実在の「1日」だと
+            # 誤読されないよう、月までが読み取り値で日は便宜上の01であることを明示する。
+            doc_date_display += "（支給年月のみ・日は01固定）"
         rows.append(
             ProposalRow(
                 source_name=src.name,
