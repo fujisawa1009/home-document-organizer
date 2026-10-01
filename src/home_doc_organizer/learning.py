@@ -87,6 +87,12 @@ def learn_from_applied_row(root: Path, row: dict, source_text: str) -> None:
     issuer = row.get("発行元(判定)", "").strip()
     if not issuer or issuer == "不明":
         return
+    if config.parse_issuer_source(row.get("発行元の根拠")) == config.ISSUER_SOURCE_FALLBACK:
+        # 推定で埋めた発行元（在籍期間照合）は学習しない。本文に実在しないので通常は
+        # 次の `issuer not in source_text` でも落ちるが、「推定値は学習しない」という要件は
+        # 本文との一致という副作用に頼らず、根拠の列で明示的に担保する（T-1230）。
+        # 列が無い古い変更案CSVでは空文字＝この条件に当たらない（従来どおりの挙動）。
+        return
     if issuer not in source_text:
         return  # 本文に存在しないキーワードは次回一致しないため学習しない
 

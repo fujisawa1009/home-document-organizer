@@ -173,6 +173,19 @@ PAYROLL_COMPETING_DOC_TITLES: tuple[str, ...] = tuple(
     if kw not in PAYROLL_COMPETING_TITLE_EXCEPTIONS
 )
 
+# 発行元(判定)の根拠（定義の正本は config.py。`learning.py` からも参照するため、
+# モジュール間の循環importを避けて依存の無い config に置いている）。
+ISSUER_SOURCE_TEXT = config.ISSUER_SOURCE_TEXT
+ISSUER_SOURCE_LEARNED = config.ISSUER_SOURCE_LEARNED
+ISSUER_SOURCE_FALLBACK = config.ISSUER_SOURCE_FALLBACK
+ISSUER_SOURCE_UNKNOWN = config.ISSUER_SOURCE_UNKNOWN
+ISSUER_SOURCE_LABELS = config.ISSUER_SOURCE_LABELS
+
+# 在籍期間フォールバックで許す支給年月の未来側の余裕（月数）。
+# 「現在も在籍」の期間は上限が無いため、何年も先の年月まで勤務先を書けてしまう。
+# 翌月分の明細を先に受け取ることはあるので1か月だけ許し、それ以上先は推定しない。
+EMPLOYMENT_FALLBACK_FUTURE_MONTHS = 1
+
 _WESTERN_DATE_RE = re.compile(r"(20\d{2})[年/\-\.](\d{1,2})[月/\-\.](\d{1,2})日?")
 # 元号1年目は「元年」表記が一般的（例: 令和元年5月1日）。"\d{1,2}" だけでは拾えない。
 _REIWA_DATE_RE = re.compile(r"令和\s*(元|\d{1,2})年\s*(\d{1,2})月\s*(\d{1,2})日")
@@ -197,6 +210,16 @@ class ClassificationResult:
     # （給与・賞与明細）／"mtime"=読めずファイル更新日時で代用（estimated_date=True と対応）。
     # 既定は "day"（既存の呼び出し側を変えないため）。CSV表示の注記に使う。
     date_precision: str = "day"
+    # 発行元(判定)の根拠（ISSUER_SOURCE_*）。省略時は `unknown`＝「根拠不明」に倒す。
+    # 「読めた値だから text だろう」と推測で埋めると、根拠の指定を忘れた新しい経路の値が
+    # 読み取り値（FACT）として記録されてしまうため（捏造防止）。
+    issuer_source: str = ISSUER_SOURCE_UNKNOWN
+
+    def __post_init__(self) -> None:
+        if not self.issuer_source:
+            self.issuer_source = ISSUER_SOURCE_UNKNOWN
+        elif self.issuer_source not in ISSUER_SOURCE_LABELS:
+            raise ValueError(f"未知の issuer_source です: {self.issuer_source!r}")
 
 
 def _find_issuer(text: str, category_key: str) -> str:
@@ -259,7 +282,7 @@ class _PayrollPeriod:
     doc_type: str
 
 
-def _find_payroll_period(text: str) -> _PayrollPeriod | None:
+def _find_payroll_period(text: str, now: datetime | None = None) -> _PayrollPeriod | None:
     """「202601月給与」「2026年6月給与」「令和8年6月給与」から支給年月と種別を読む。
 
     西暦・和暦の一致を**テキストに現れた順**で評価し、最初の妥当なものを採る。
@@ -267,7 +290,7 @@ def _find_payroll_period(text: str) -> _PayrollPeriod | None:
     次の一致を見る（先頭の化けた1件で諦めない）。妥当な年の上限を「今年＋1年」に
     しているのは、翌年分の明細を先に受け取ることはあっても数十年先の明細は無いため。
     """
-    year_max = datetime.now().year + 1
+    year_max = (now or datetime.now()).year + 1
     candidates: list[tuple[int, _PayrollPeriod]] = []
     for m in _PAYROLL_YEAR_MONTH_RE.finditer(text):
         candidates.append((m.start(), _to_period(int(m.group(1)), m.group(2), m.group(3))))
@@ -317,8 +340,74 @@ def _find_payroll_issuer(text: str) -> str:
     return max(candidates, key=lambda c: (c[0], -c[1]))[2]
 
 
+def _issuer_from_employment(
+    period: _PayrollPeriod | None,
+    date_precision: str,
+    root: Path | None,
+    now: datetime | None = None,
+    employment_periods: tuple[config.EmploymentPeriod, ...] | None = None,
+) -> tuple[str, str]:
+    """本文から発行元が読めなかった明細について、在籍期間との照合で勤務先を推定する。
+
+    戻り値は (発行元, 根拠の説明)。推定できなければ ("", 理由) を返し、呼び出し側は
+    発行元を `不明` のまま残す（埋めたことにしない＝T-1230の要件7）。
+
+    捏造防止のため、次の条件を**すべて**満たしたときだけ推定する:
+      (a) 支給年月が読み取れている（`date_precision == "month"`）。
+          更新日時で代用した日付（=スキャンした日）は支給年月ではないので使わない。
+      (b) その支給年月を含む在籍期間が、在籍期間表に**ちょうど1件**ある。
+          0件＝在籍していない時期の明細（他社の明細・誤った年月の読み取り）なので埋めない。
+          2件以上＝期間が重なっていて勤務先が一意に決まらないので埋めない。
+      (c) 支給年月が未来に行き過ぎていない（翌月分までは許す）。
+          「現在も在籍」の期間は上限が無いため、この条件が無いと何年先でも埋まってしまう。
+    """
+    if date_precision != "month" or period is None:
+        return "", "支給年月が読み取れていないため在籍期間照合はしない"
+
+    now = now or datetime.now()
+    # バッチ単位で読み込んだ表が渡されていればそれを使う（1ファイルごとに読み直すと、
+    # 処理中に設定ファイルが書き換わった場合に同じバッチの前半と後半で判定が変わる）。
+    periods = (
+        employment_periods
+        if employment_periods is not None
+        else config.load_employment_periods(root, now=now)
+    )
+    if not periods:
+        return "", "在籍期間の設定が無い/読めないため在籍期間照合はしない"
+
+    limit_ym = now.year * 12 + (now.month - 1) + EMPLOYMENT_FALLBACK_FUTURE_MONTHS
+    target_ym = period.year * 12 + (period.month - 1)
+    if target_ym > limit_ym:
+        return "", f"支給年月{period.year}-{period.month:02d}が未来のため在籍期間照合はしない"
+
+    matched = [p for p in periods if p.covers(period.year, period.month)]
+    if len(matched) != 1:
+        detail = "在籍期間外" if not matched else f"在籍期間が{len(matched)}件重複し一意でない"
+        return "", f"支給年月{period.year}-{period.month:02d}は{detail}のため発行元を推定しない"
+
+    hit = matched[0]
+    # 「現在も在籍」の期間は終わりが無いため、在籍確認が取れている月から一定期間までに
+    # 推定の上限を切る（転職して設定を直し忘れたときに前職の社名を書き続けないため）。
+    limit_ym = hit.inference_limit_ym(config.EMPLOYMENT_INFERENCE_GRACE_MONTHS)
+    if period.year * 100 + period.month > limit_ym:
+        return "", (
+            f"支給年月{period.year}-{period.month:02d}は在籍確認済みの範囲"
+            f"（〜{limit_ym // 100}-{limit_ym % 100:02d}）を超えるため発行元を推定しない"
+            "（在籍期間表 employment_periods.json の更新が必要）"
+        )
+    return hit.employer, (
+        f"発行元は本文から読めず、支給年月{period.year}-{period.month:02d}が"
+        f"在籍期間{hit.label()}に含まれるため勤務先『{hit.employer}』を推定"
+    )
+
+
 def _classify_payroll(
-    text: str, mtime: datetime, hint_text: str = ""
+    text: str,
+    mtime: datetime,
+    hint_text: str = "",
+    root: Path | None = None,
+    now: datetime | None = None,
+    employment_periods: tuple[config.EmploymentPeriod, ...] | None = None,
 ) -> ClassificationResult | None:
     """給与明細・賞与明細なら結果を返す。該当しなければ None（既存ロジックへ委ねる）。
 
@@ -345,8 +434,9 @@ def _classify_payroll(
 
     bonus_title = any(kw in text for kw in PAYROLL_TITLE_KEYWORDS["賞与明細"])
     salary_title = any(kw in text for kw in PAYROLL_TITLE_KEYWORDS["給与明細"])
-    hint_period = _find_payroll_period(hint_text) if hint_text else None
-    body_period = _find_payroll_period(text)
+    now = now or datetime.now()
+    hint_period = _find_payroll_period(hint_text, now) if hint_text else None
+    body_period = _find_payroll_period(text, now)
     core_hits = sum(1 for m in PAYROLL_CORE_FIELD_MARKERS if m in text)
     supporting_hits = sum(1 for m in PAYROLL_SUPPORTING_FIELD_MARKERS if m in text)
     layout_match = core_hits >= PAYROLL_CORE_MARKER_MIN or (
@@ -418,11 +508,34 @@ def _classify_payroll(
             precision = "mtime"
             date_note = "支給年月が読み取れず更新日時で代用"
 
-    issuer = _find_payroll_issuer(text) or "不明"
+    issuer = _find_payroll_issuer(text)
+    if issuer:
+        issuer_source = ISSUER_SOURCE_TEXT
+        issuer_note = ""
+    else:
+        # 最後の手段: 在籍期間との照合で勤務先を推定する（読み取り値ではないので印を付ける）。
+        issuer, issuer_note = _issuer_from_employment(
+            period, precision, root, now=now, employment_periods=employment_periods
+        )
+        issuer_source = ISSUER_SOURCE_FALLBACK if issuer else ISSUER_SOURCE_UNKNOWN
+    if not issuer:
+        issuer = "不明"
 
     # 発行元が読めなくても「給与/賞与明細である」判定自体は確かなので `_要確認` へは倒さない
     # （倒すと誤分類前と同じ状態＝ファイル名が `不明_不明` に戻ってしまう）。
-    confidence = "高" if issuer != "不明" and not estimated else "中"
+    # 推定で埋めた発行元（fallback）は読み取り値と同じ扱いにはせず、確信度を「高」にしない。
+    confidence = (
+        "高"
+        if issuer != "不明" and not estimated and issuer_source != ISSUER_SOURCE_FALLBACK
+        else "中"
+    )
+
+    reason = (
+        f"給与/賞与明細の優先判定に一致（{doc_type}・欄名 中核{core_hits}件/補助{supporting_hits}件）"
+        f"・{date_note}"
+    )
+    if issuer_note:
+        reason += f"・{issuer_note}（issuer_source={issuer_source}）"
 
     return ClassificationResult(
         category_key="給与",
@@ -432,11 +545,9 @@ def _classify_payroll(
         date_str=date_str,
         estimated_date=estimated,
         confidence=confidence,
-        reason=(
-            f"給与/賞与明細の優先判定に一致（{doc_type}・欄名 中核{core_hits}件/補助{supporting_hits}件）"
-            f"・{date_note}"
-        ),
+        reason=reason,
         date_precision=precision,
+        issuer_source=issuer_source,
     )
 
 
@@ -455,11 +566,19 @@ def _fallback_result(mtime: datetime, reason: str) -> ClassificationResult:
 
 
 def classify_document(
-    text: str, ext: str, mtime: datetime, hint_text: str = ""
+    text: str,
+    ext: str,
+    mtime: datetime,
+    hint_text: str = "",
+    root: Path | None = None,
+    now: datetime | None = None,
+    employment_periods: tuple[config.EmploymentPeriod, ...] | None = None,
 ) -> ClassificationResult:
     """`hint_text` はファイル名・受信箱サブフォルダ名だけを連結したもの（`text` の一部）。
 
     省略時は「本文だけが手がかり」として扱う（既存の呼び出し側の挙動は変わらない）。
+    `root` は給与・賞与明細の発行元フォールバックが在籍期間表
+    （`_学習データ/employment_periods.json`）を読むためだけに使う。省略時は config の既定値。
     """
     ext = ext.lower()
     if ext not in config.SUPPORTED_EXTENSIONS:
@@ -469,7 +588,9 @@ def classify_document(
         return _fallback_result(mtime, "テキスト抽出不可（内容が読み取れない・破損/パスワード保護の可能性）")
 
     # 給与・賞与明細は税金/保険のキーワードを必ず含むため、一致数の比較より先に判定する
-    payroll = _classify_payroll(text, mtime, hint_text=hint_text)
+    payroll = _classify_payroll(
+        text, mtime, hint_text=hint_text, root=root, now=now, employment_periods=employment_periods
+    )
     if payroll is not None:
         return payroll
 
@@ -501,6 +622,9 @@ def classify_document(
         best_doc_type = "不明（要確認）"
 
     issuer = _find_issuer(text, best_category) or "不明"
+    # 既存カテゴリ（税金/銀行/保険/身分証）の発行元は従来どおり本文からの読み取りのみ。
+    # 在籍期間照合のフォールバックは給与カテゴリ専用で、ここには一切入らない。
+    issuer_source = ISSUER_SOURCE_UNKNOWN if issuer == "不明" else ISSUER_SOURCE_TEXT
     date_str, estimated = _extract_date(text)
     if not date_str:
         date_str = mtime.strftime("%Y%m%d")
@@ -537,6 +661,7 @@ def classify_document(
         confidence=confidence,
         reason=reason,
         date_precision="mtime" if estimated else "day",
+        issuer_source=issuer_source,
     )
 
 
@@ -552,10 +677,17 @@ def _from_learned_rule(rule: dict, mtime: datetime) -> ClassificationResult:
         confidence="高",
         reason=f"学習済みルールに一致（キーワード: {rule['keyword']!r}）",
         date_precision="mtime",
+        # 学習ルールの発行元は過去に決定者が承認・訂正した値＝推定(fallback)とは区別する。
+        issuer_source=ISSUER_SOURCE_LEARNED,
     )
 
 
-def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
+def classify_file(
+    path: Path,
+    root: Path | None = None,
+    now: datetime | None = None,
+    employment_periods: tuple[config.EmploymentPeriod, ...] | None = None,
+) -> ClassificationResult:
     """root を渡すと、キーワード辞書より先に学習済みルール（learning.py）を試す。
 
     学習ルールは過去にCEOが承認した「発行元(判定)」をキーワードとして記憶したもの
@@ -567,6 +699,11 @@ def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
     ヒントを入れてもらうことで、OCRが失敗しても確実に分類できるようにするため
     （CEO確認2026-08-16）。例: `00_受信箱/01_証明写真/IMG_1234.jpg` なら
     「01_証明写真」もヒントとして使われる。
+
+    `now` は「今」として使う時刻（年の妥当性・未来の支給年月の判定に使う）。バッチの開始時刻を
+    渡すと、月末深夜に日付が変わっても1回の実行内で判定が揺れない（省略時は都度 `now()`）。
+    `employment_periods` は在籍期間表のスナップショット（省略時は `root` から読む）。
+    どちらも給与・賞与明細の判定だけに影響し、既存4カテゴリの挙動は変わらない。
     """
     ext = path.suffix.lower()
     mtime = datetime.fromtimestamp(path.stat().st_mtime)
@@ -590,12 +727,35 @@ def classify_file(path: Path, root: Path | None = None) -> ClassificationResult:
             # 決定者が承認した「発行元(判定)」＝勤務先の社名になりがちで、同じ勤務先が出す
             # 源泉徴収票・通知書・内定通知まで「給与明細」にしてしまう。明細票である裏付けが
             # 取れないときは学習ルールを使わず、通常のキーワード辞書経路へ落とす。
-            payroll = _classify_payroll(text, mtime, hint_text=hint_text)
+            payroll = _classify_payroll(
+                text,
+                mtime,
+                hint_text=hint_text,
+                root=root,
+                now=now,
+                employment_periods=employment_periods,
+            )
             if payroll is None:
-                return classify_document(text, ext, mtime, hint_text=hint_text)
+                return classify_document(
+                    text,
+                    ext,
+                    mtime,
+                    hint_text=hint_text,
+                    root=root,
+                    now=now,
+                    employment_periods=employment_periods,
+                )
             return _merge_payroll_month(learned, payroll)
 
-    return classify_document(text, ext, mtime, hint_text=hint_text)
+    return classify_document(
+        text,
+        ext,
+        mtime,
+        hint_text=hint_text,
+        root=root,
+        now=now,
+        employment_periods=employment_periods,
+    )
 
 
 def _merge_payroll_month(

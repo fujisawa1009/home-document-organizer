@@ -15,7 +15,9 @@ from . import classify, config, logger
 from .inbox_scan import list_inbox_files
 from .naming import build_filename, unique_destination
 
-CSV_COLUMNS = [
+# apply 側（apply_changes.read_proposal_rows）が存在を必須として検査する列。
+# 指示書7-3で決まった列構成そのもので、apply が実際に読む列もこの中に収まっている。
+REQUIRED_CSV_COLUMNS = [
     "元ファイル名",
     "元ファイルパス",
     "提案カテゴリ",
@@ -26,6 +28,16 @@ CSV_COLUMNS = [
     "確信度",
     "承認",
     "備考",
+]
+
+# 書き出す列。必須列の**後ろへ追記**する形でのみ増やす（既に `_変更案` に残っている
+# 古いCSVを apply できなくしないため＝必須列の検査は REQUIRED_CSV_COLUMNS に対して行う）。
+# `発行元の根拠`（2026-10-01・T-1230）: 発行元(判定)が「書類から読み取れた値」なのか
+# 「在籍期間照合で推定した値」なのかを1列で見分けられるようにする。推定値を読み取り値と
+# 同じ見た目でCSVに並べると、後から家計・年収の一次データとして使うときに区別できない。
+CSV_COLUMNS = [
+    *REQUIRED_CSV_COLUMNS,
+    "発行元の根拠",
 ]
 
 
@@ -40,6 +52,7 @@ class ProposalRow:
     doc_date: str
     confidence: str
     reason: str
+    issuer_source: str = ""
 
     def to_csv_row(self, auto_approve: bool = False) -> list[str]:
         return [
@@ -53,10 +66,16 @@ class ProposalRow:
             self.confidence,
             "OK" if auto_approve else "",  # 承認: 手動時は空欄／自動運転時はOKを直接記入
             self.reason,
+            classify.ISSUER_SOURCE_LABELS.get(self.issuer_source, self.issuer_source),
         ]
 
 
-def _classify_safely(root: Path, src: Path, when: datetime) -> classify.ClassificationResult:
+def _classify_safely(
+    root: Path,
+    src: Path,
+    when: datetime,
+    employment_periods: tuple[config.EmploymentPeriod, ...] | None = None,
+) -> classify.ClassificationResult:
     """classify_file の例外で propose 全体を止めない（8章）。
 
     失敗は _要確認 へ倒しつつ、CSVの備考だけでなく操作ログにも残す
@@ -65,7 +84,9 @@ def _classify_safely(root: Path, src: Path, when: datetime) -> classify.Classifi
     日付境界をまたいで別日のログファイルに分散しないようにするため。
     """
     try:
-        return classify.classify_file(src, root=root)
+        return classify.classify_file(
+            src, root=root, now=when, employment_periods=employment_periods
+        )
     except Exception as exc:  # noqa: BLE001 - 1ファイルの想定外失敗で全体を止めない
         logger.log_operation(
             root, logger.OP_CLASSIFY_ERROR, str(src), "", logger.RESULT_NG, detail=str(exc), when=when
@@ -85,9 +106,13 @@ def _classify_safely(root: Path, src: Path, when: datetime) -> classify.Classifi
 
 def build_proposal_rows(root: Path, when: datetime | None = None) -> list[ProposalRow]:
     when = when or datetime.now()
+    # 在籍期間表はバッチ開始時に一度だけ読む（1ファイルごとに読み直すと、処理中に設定が
+    # 書き換わった場合に同じバッチの前半と後半で発行元の判定が変わる。iCloud上のreadを
+    # ファイル数ぶん繰り返さない効果もある）。
+    employment_periods = config.load_employment_periods(root, now=when)
     rows: list[ProposalRow] = []
     for src in list_inbox_files(root):
-        result = _classify_safely(root, src, when)
+        result = _classify_safely(root, src, when, employment_periods=employment_periods)
         new_filename = build_filename(
             result.date_str, result.doc_type, result.issuer, src.suffix, result.estimated_date
         )
@@ -98,6 +123,26 @@ def build_proposal_rows(root: Path, when: datetime | None = None) -> list[Propos
             # 給与・賞与明細のように月単位の書類は日を持たない。日付欄が実在の「1日」だと
             # 誤読されないよう、月までが読み取り値で日は便宜上の01であることを明示する。
             doc_date_display += "（支給年月のみ・日は01固定）"
+        if result.issuer_source == classify.ISSUER_SOURCE_FALLBACK:
+            # 推定で埋めた発行元は操作ログにも1件残す。CSVは承認後に手で書き換えられうるが、
+            # ログは追記専用なので「どのファイルの発行元を何を根拠に推定したか」が後から追える。
+            try:
+                logger.log_operation(
+                    root,
+                    logger.OP_ISSUER_FALLBACK,
+                    str(src),
+                    "",
+                    logger.RESULT_OK,
+                    detail=(
+                        f"発行元『{result.issuer}』は読み取り値ではなく推定"
+                        f"（issuer_source={result.issuer_source}）: {result.reason}"
+                    ),
+                    when=when,
+                )
+            except OSError:
+                # 監査ログの書き込み失敗で変更案そのものを作れなくしない（8章）。
+                # 推定であること自体はCSVの `発行元の根拠` 列と備考にも残る。
+                pass
         rows.append(
             ProposalRow(
                 source_name=src.name,
@@ -109,6 +154,7 @@ def build_proposal_rows(root: Path, when: datetime | None = None) -> list[Propos
                 doc_date=doc_date_display,
                 confidence=result.confidence,
                 reason=result.reason,
+                issuer_source=result.issuer_source,
             )
         )
     return rows

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from . import cleanup_inbox, config, extract, learning, logger
 from .naming import safe_copy
-from .proposal import CSV_COLUMNS
+from .proposal import REQUIRED_CSV_COLUMNS
 
 # 「承認」列としてOKとみなす値（大小文字・前後空白を無視）。
 # それ以外（空欄・不明な値・明示的なNG等）はすべて未承認として扱う＝安全側デフォルト。
@@ -54,9 +54,19 @@ def _latest_proposal_csv(root: Path) -> Path | None:
 def read_proposal_rows(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        missing = [c for c in CSV_COLUMNS if c not in (reader.fieldnames or [])]
-        if missing:
-            raise ValueError(f"変更案CSVの列構成が不正です（不足列: {missing}）: {csv_path}")
+        fieldnames = list(reader.fieldnames or [])
+        # 重複列を拒否する: csv.DictReader は同名列があると**後ろの値**を採用するため、
+        # 見た目の「承認」が空欄でも末尾に重複した「承認=OK」があれば実行されてしまう。
+        if len(fieldnames) != len(set(fieldnames)):
+            raise ValueError(f"変更案CSVに重複した列があります: {fieldnames}: {csv_path}")
+        # 先頭は必須列が定義順どおりに並んでいること。後ろへ情報列が増えるのは許す
+        # （`発行元の根拠` のような後から追記した列は古いCSVには存在しない／表計算ソフトが
+        # 末尾に空列を足すことがある）。途中への列挿入・列順の入れ替えは拒否する。
+        if fieldnames[: len(REQUIRED_CSV_COLUMNS)] != REQUIRED_CSV_COLUMNS:
+            raise ValueError(
+                f"変更案CSVの列構成が不正です（先頭{len(REQUIRED_CSV_COLUMNS)}列が"
+                f"必須列と一致しません）: {fieldnames}: {csv_path}"
+            )
         return list(reader)
 
 
@@ -121,9 +131,34 @@ def apply_approved_changes(
             results.append(ApplyResult(row_index=i, source_path=src_raw, ok=False, error=str(exc)))
             continue
 
-        logger.log_operation(
-            root, logger.OP_RENAME_EXEC, str(resolved_src), str(dest), logger.RESULT_OK, when=when
+        # 推定で埋めた発行元の行は、実行ログ側にもその旨を残す（CSVは承認時に書き換えられうるが
+        # ログは追記専用なので「どの実ファイルが推定値の名前で置かれたか」が後から追える）。
+        # 根拠が推定でない行のログ内容は従来と同一（既存カテゴリのログを変えない）。
+        # `row.get(...)` は、ヘッダーより少ないセル数の行では None を返す（Excel/Numbersや
+        # 手修正で起きる）。ここはコピー成功後なので、素の文字列操作で AttributeError を
+        # 出すとバッチの残り全行が未処理のまま止まる＝必ず正規化してから判定する。
+        issuer_source = config.parse_issuer_source(row.get("発行元の根拠"))
+        detail = (
+            f"発行元の根拠={issuer_source}"
+            if issuer_source == config.ISSUER_SOURCE_FALLBACK
+            else ""
         )
+        try:
+            logger.log_operation(
+                root,
+                logger.OP_RENAME_EXEC,
+                str(resolved_src),
+                str(dest),
+                logger.RESULT_OK,
+                detail=detail,
+                when=when,
+            )
+        except OSError:
+            # ここはコピー成功後・受信箱削除前。ログ書き込みの失敗で例外を投げると、
+            # 「コピー済みなのに元ファイルが残り、残りの行も未処理」のまま終わり、次回の
+            # auto-run が同じファイルを再処理して連番コピー（_2）を作ってしまう。
+            # ログが書けない状況（容量不足・権限）でも後処理と残りの行は進める。
+            pass
 
         deleted_source = _delete_source_after_copy(root, resolved_src, when=when)
         results.append(

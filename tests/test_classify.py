@@ -538,3 +538,235 @@ def test_mixed_era_and_western_notation_takes_first_in_text_order():
     text = "給与明細書 令和8年6月給与 総支給額 差引支給額 ※前月は2026年5月給与でした"
     result = classify_document(text, ".pdf", FIXED_MTIME)
     assert result.date_str == "20260601"  # 令和8年6月 = 2026年6月（テキスト上で先に出る）
+
+
+# --- 発行元の在籍期間照合フォールバック（T-1230） -------------------------------------
+#
+# 実物の給与明細10件のうち9件は pypdf もOCRも1文字も返さない（実測）。本文が無いので
+# 発行元が読めず、ファイル名（`202601月給与.pdf`）にも社名が無いため全件 `_不明` になっていた。
+# 「支給年月が在籍期間の中なら、その期間の勤務先を発行元として推定する」フォールバックを
+# 足したので、効くケース（正例）と効いてはいけないケース（負例）の両方を固定する。
+
+
+def _payroll_file(tmp_path: Path, name: str, monkeypatch, text: str = ""):
+    """OCRが `text` を返すスキャンPDFを模したファイルを作る（既定は1文字も返さない）。"""
+    src = tmp_path / name
+    src.write_bytes(b"dummy")
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: text)
+    return src
+
+
+def _employment_file(root: Path, payload: str) -> None:
+    path = config.folder_path(root, config.LEARNING) / config.EMPLOYMENT_PERIODS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+
+def _months_from_now(delta_months: int) -> tuple[int, int]:
+    now = datetime.now()
+    total = now.year * 12 + (now.month - 1) + delta_months
+    return total // 12, total % 12 + 1
+
+
+def test_payroll_issuer_filled_from_employment_period(tmp_path, monkeypatch):
+    """正例: 本文が1文字も読めなくても、支給年月が在籍期間内なら勤務先を推定して埋める。"""
+    src = _payroll_file(tmp_path, "202601月給与.pdf", monkeypatch)
+
+    result = classify_file(src)
+
+    assert result.issuer == "株式会社エフティグループ"
+    assert result.issuer_source == "fallback"
+    assert "issuer_source=fallback" in result.reason  # 推定である印が備考に残る
+    assert "在籍期間" in result.reason
+    # 推定値は読み取り値と同じ扱いにしない＝確信度は「高」にしない
+    assert result.confidence == "中"
+
+
+def test_payroll_issuer_not_filled_before_employment_start(tmp_path, monkeypatch):
+    """負例（最重要）: 在籍開始前（2024-09）の支給年月には適用しない＝捏造防止。"""
+    src = _payroll_file(tmp_path, "202409月給与.pdf", monkeypatch)
+
+    result = classify_file(src)
+
+    assert result.category_key == "給与"  # 給与明細という判定自体は変わらない
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+    assert result.confidence == "中"
+
+
+def test_payroll_issuer_not_filled_after_employment_end(tmp_path, monkeypatch):
+    """負例: 在籍期間が終わっている（転職後）の月には前職の社名を書かない。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    _employment_file(
+        root, '[{"employer": "株式会社前職", "start": "202410", "end": "202603"}]'
+    )
+    src = _payroll_file(tmp_path, "202604月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root)
+
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_payroll_issuer_not_filled_for_far_future_month(tmp_path, monkeypatch):
+    """負例: 「現在も在籍」の期間は上限が無いので、未来の支給年月は推定しない
+    （翌月分までは許すが、それ以上先は在籍しているか分からない）。"""
+    year, month = _months_from_now(6)
+    src = _payroll_file(tmp_path, f"{year}{month:02d}月給与.pdf", monkeypatch)
+
+    result = classify_file(src)
+
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_payroll_issuer_not_filled_when_payment_month_unreadable():
+    """負例: 支給年月が読めない（更新日時で代用した）明細には適用しない。
+    更新日時はスキャンした日であって支給年月ではないため。"""
+    text = "### 本人給 役職手当 通勤手当 総支給額 控除合計 差引支給額"
+    result = classify_document(text, ".pdf", FIXED_MTIME)
+
+    assert result.category_key == "給与"
+    assert result.estimated_date is True
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_payroll_issuer_read_from_text_wins_over_fallback():
+    """本文から読める明細は従来どおり実判定を優先する（推定で上書きしない）。"""
+    text = "給与明細書 2026年6月給与 本人給 総支給額 差引支給額\n株式会社別会社"
+    result = classify_document(text, ".pdf", FIXED_MTIME)
+
+    assert result.issuer == "株式会社別会社"
+    assert result.issuer_source == "text"
+    assert result.confidence == "高"
+
+
+def test_employment_periods_file_overrides_default(tmp_path, monkeypatch):
+    """在籍期間は設定ファイルで差し替えられる（転職してもコードを直さずに済む）。
+    既定値とマージせず完全に置き換える＝古い勤務先名が残らないこと。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    _employment_file(root, '[{"employer": "株式会社転職先", "start": "202604"}]')
+    src = _payroll_file(tmp_path, "202605月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root)
+
+    assert result.issuer == "株式会社転職先"
+    assert result.issuer_source == "fallback"
+
+
+def test_broken_employment_periods_file_leaves_issuer_unknown(tmp_path, monkeypatch):
+    """設定ファイルが壊れているときは既定値へ戻さず `不明` のまま残す
+    （戻すと「書き換えたが壊れていた」ときに古い勤務先名を書いてしまう）。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    _employment_file(root, "{壊れたJSON")
+    src = _payroll_file(tmp_path, "202601月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root)
+
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_overlapping_employment_periods_are_not_guessed(tmp_path, monkeypatch):
+    """期間が重なっていて勤務先が一意に決まらない月は推定しない（当てずっぽうを避ける）。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    _employment_file(
+        root,
+        '[{"employer": "株式会社A", "start": "202410", "end": "202612"},'
+        ' {"employer": "株式会社B", "start": "202601"}]',
+    )
+    src = _payroll_file(tmp_path, "202603月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root)
+
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_employment_fallback_does_not_leak_into_other_categories(tmp_path, monkeypatch):
+    """既存4カテゴリ（税金/銀行/保険/身分証）の挙動は一切変えない。
+    発行元が読めない税書類は従来どおり `不明` のまま（勤務先名で埋めない）。"""
+    result = classify_document("納税証明書 2026年6月1日 交付", ".pdf", FIXED_MTIME)
+
+    assert result.category_key == "税金"
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+
+
+def test_payroll_issuer_not_filled_beyond_verified_through(tmp_path, monkeypatch):
+    """負例: 在籍中（end なし）でも「在籍を確認できている月＋猶予」を超えた支給年月には
+    適用しない。転職して在籍期間表を直し忘れたときに前職の社名を書き続けないため。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    # 在籍確認は2025-01まで＝推定に使える上限は2026-01（猶予12か月）
+    _employment_file(
+        root,
+        '[{"employer": "株式会社エフティグループ", "start": "202410",'
+        ' "verified_through": "202501"}]',
+    )
+    src = _payroll_file(tmp_path, "202603月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root)
+
+    assert result.issuer == "不明"
+    assert result.issuer_source == "unknown"
+    assert "在籍確認済みの範囲" in result.reason
+
+    # 上限内（2026-01）の月なら従来どおり推定が働く
+    src_in_range = _payroll_file(tmp_path, "202601月給与.pdf", monkeypatch)
+    in_range = classify_file(src_in_range, root=root)
+    assert in_range.issuer == "株式会社エフティグループ"
+    assert in_range.issuer_source == "fallback"
+
+
+def test_unknown_issuer_source_value_is_rejected():
+    """根拠の値は定義済みのものだけ（未知の値を黙って記録させない）。"""
+    from home_doc_organizer.classify import ClassificationResult
+
+    with pytest.raises(ValueError):
+        ClassificationResult(
+            category_key="給与",
+            suggested_folder=config.CATEGORY_PAYROLL,
+            doc_type="給与明細",
+            issuer="株式会社A",
+            date_str="20260101",
+            estimated_date=False,
+            confidence="中",
+            reason="テスト",
+            issuer_source="でっちあげ",
+        )
+
+
+def test_future_month_judgement_uses_the_given_now(tmp_path, monkeypatch):
+    """「未来の支給年月か」の判定は渡された実行時刻で決まること（実時計に依存しない）。
+
+    バッチ開始時刻を渡す運用にしているので、月末深夜に日付が変わっても1回の実行の中で
+    判定が揺れない（同じ支給年月のファイルが処理順によって推定される/されないに分かれない）。
+    """
+    src = _payroll_file(tmp_path, "202701月給与.pdf", monkeypatch)
+
+    # 実行時刻が2026-12 → 翌月分(2027-01)は許容範囲内
+    assert classify_file(src, now=datetime(2026, 12, 31, 23, 59)).issuer == "株式会社エフティグループ"
+    # 実行時刻が2026-11 → 2か月先なので推定しない
+    assert classify_file(src, now=datetime(2026, 11, 30, 0, 0)).issuer == "不明"
+
+
+def test_employment_periods_snapshot_argument_wins_over_file(tmp_path, monkeypatch):
+    """バッチ開始時に読んだ在籍期間表のスナップショットを渡せること
+    （処理中に設定ファイルが書き換わってもバッチ内で判定が揺れない）。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    _employment_file(root, '[{"employer": "株式会社ファイル側", "start": "202410"}]')
+    snapshot = config.parse_employment_periods(
+        [{"employer": "株式会社スナップショット側", "start": "202410", "verified_through": "202609"}]
+    )
+    src = _payroll_file(tmp_path, "202601月給与.pdf", monkeypatch)
+
+    result = classify_file(src, root=root, employment_periods=snapshot)
+
+    assert result.issuer == "株式会社スナップショット側"

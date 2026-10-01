@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from . import config
@@ -91,17 +92,20 @@ def cmd_auto_run(args: argparse.Namespace) -> int:
     承認プロセスを経ないため、実行結果は必ず呼び出し側（launchdラッパー）で通知すること。
     """
     root = config.get_root(args.root)
+    # 実行時刻は1回だけ決めて全段階へ渡す。段階ごとに now() を取ると、月末深夜をまたいだ実行で
+    # ログが2日分に分かれたり、「未来の支給年月か」の判定が前半と後半で変わったりする。
+    run_at = datetime.now()
 
-    scan_results = archive_inbox(root)
+    scan_results = archive_inbox(root, when=run_at)
     if not scan_results:
         print("受信箱に新規ファイルなし。何もしません。")
         return 0
 
-    csv_path, rows = generate_proposal_csv(root, auto_approve=True)
+    csv_path, rows = generate_proposal_csv(root, when=run_at, auto_approve=True)
     print(f"変更案CSVを作成（自動承認）: {csv_path}")
     print(f"件数: {len(rows)}")
 
-    results = apply_approved_changes(root, csv_path=csv_path)
+    results = apply_approved_changes(root, csv_path=csv_path, when=run_at)
     ok = sum(1 for r in results if r.ok)
     ng = len(results) - ok
     print(f"自動実行完了: {len(results)}件（成功{ok}件 / 失敗{ng}件）")

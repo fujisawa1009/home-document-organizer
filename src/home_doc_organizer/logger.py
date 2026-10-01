@@ -21,6 +21,9 @@ OP_RENAME_EXEC = "リネーム実行"
 OP_CLASSIFY_ERROR = "分類エラー"
 OP_SKIP = "スキップ"
 OP_INBOX_DELETE = "受信箱元ファイル削除"
+# 発行元を書類から読み取れず、在籍期間照合で推定した（T-1230）。読み取り値との区別を
+# 追記専用のログにも残すための種別。
+OP_ISSUER_FALLBACK = "発行元推定"
 
 RESULT_OK = "成功"
 RESULT_NG = "失敗"

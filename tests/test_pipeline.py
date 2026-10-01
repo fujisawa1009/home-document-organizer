@@ -141,7 +141,7 @@ def test_full_flow_propose_approve_apply(root: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         classify,
         "classify_file",
-        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
+        lambda path, root=None, **kwargs: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
     )
 
     archive_inbox(root, when=FIXED_WHEN)
@@ -210,7 +210,7 @@ def test_apply_does_not_delete_source_when_not_archived(root: Path, monkeypatch:
     monkeypatch.setattr(
         classify,
         "classify_file",
-        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
+        lambda path, root=None, **kwargs: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "麹町税務署"),
     )
     csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN)
     with csv_path.open(encoding="utf-8-sig") as f:
@@ -318,7 +318,7 @@ def test_apply_logs_skip_for_unapproved_rows(root: Path, monkeypatch: pytest.Mon
     monkeypatch.setattr(
         classify,
         "classify_file",
-        lambda path, root=None: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署"),
+        lambda path, root=None, **kwargs: _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署"),
     )
     archive_inbox(root, when=FIXED_WHEN)
     csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN)  # 承認列は空欄のまま
@@ -445,7 +445,7 @@ def test_generate_proposal_csv_auto_approve_writes_ok_for_every_row(
     _put_inbox_file(root, "high.pdf")
     _put_inbox_file(root, "unknown.pdf")
 
-    def fake_classify(path: Path, root=None):
+    def fake_classify(path: Path, root=None, **kwargs):
         if path.name == "high.pdf":
             return _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署")
         return classify.ClassificationResult(
@@ -477,7 +477,7 @@ def test_auto_run_flow_files_everything_including_low_confidence(
     _put_inbox_file(root, "tax.pdf")
     _put_inbox_file(root, "mystery.pdf")
 
-    def fake_classify(path: Path, root=None):
+    def fake_classify(path: Path, root=None, **kwargs):
         if path.name == "tax.pdf":
             return _fake_classification("税金", config.CATEGORY_TAX, "納税証明書", "税務署")
         return classify.ClassificationResult(
@@ -528,6 +528,304 @@ def test_auto_run_files_payslip_into_payroll_category(root: Path, monkeypatch: p
     # 日付欄は「支給年月のみ・日は01固定」と注記され、実在の1日付と誤読されないこと
     assert "支給年月のみ" in rows[0].doc_date
     assert len(results) == 1 and results[0].ok
-    assert (root / config.CATEGORY_PAYROLL / "20260101_給与明細_不明.pdf").exists()
+    # 発行元は本文から読めないが、支給年月2026-01が在籍期間内なので勤務先を推定して埋める
+    # （T-1230。推定であることは `発行元の根拠` 列・備考・操作ログで区別できる）。
+    assert (
+        root / config.CATEGORY_PAYROLL / "20260101_給与明細_株式会社エフティグループ.pdf"
+    ).exists()
     assert list((root / config.NEEDS_REVIEW).iterdir()) == []
     assert list((root / config.CATEGORY_TAX).iterdir()) == []
+
+
+def test_proposal_csv_marks_inferred_issuer_and_logs_it(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """推定で埋めた発行元が、読み取り値と区別できる形でCSVと操作ログに残ること（T-1230）。
+
+    発行元を推定で埋めると `_不明` は消えるが、そのままでは「読み取れた値」と見分けが
+    つかない。CSVの `発行元の根拠` 列・備考の `issuer_source=fallback`・追記専用の操作ログ
+    の3か所で区別できることを固定する。
+    """
+    _put_inbox_file(root, "202601月給与.pdf")
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: "")
+
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path, rows = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+
+    assert rows[0].issuer == "株式会社エフティグループ"
+    with csv_path.open(encoding="utf-8-sig") as f:
+        first = next(csv.DictReader(f))
+    assert first["発行元(判定)"] == "株式会社エフティグループ"
+    assert first["発行元の根拠"].startswith("fallback")
+    assert "読み取り値ではない" in first["発行元の根拠"]
+    assert "issuer_source=fallback" in first["備考"]
+
+    log_text = (
+        config.folder_path(root, config.LOGS) / f"操作ログ_{FIXED_WHEN:%Y%m%d}.csv"
+    ).read_text(encoding="utf-8-sig")
+    assert "発行元推定" in log_text
+    assert "issuer_source=fallback" in log_text
+
+    # 実行（コピー）ログ側にも根拠が残る＝どの実ファイルが推定値の名前で置かれたか追える
+    apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+    log_text = (
+        config.folder_path(root, config.LOGS) / f"操作ログ_{FIXED_WHEN:%Y%m%d}.csv"
+    ).read_text(encoding="utf-8-sig")
+    assert "発行元の根拠=fallback" in log_text
+
+    # 推定値は学習ルールに取り込まれない（次回「読み取れた値」に化けない）
+    rules_path = config.folder_path(root, config.LEARNING) / "learned_rules.json"
+    assert not rules_path.exists()
+
+
+def test_proposal_csv_marks_issuer_read_from_text_as_fact(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """本文から読めた発行元は `text`（読み取り値）として記録され、推定と混ざらないこと。"""
+    _put_inbox_file(root, "payslip.pdf")
+    monkeypatch.setattr(
+        "home_doc_organizer.extract.extract_text",
+        lambda path: "給与明細書 2026年6月給与 本人給 総支給額 差引支給額\n株式会社エフティグループ",
+    )
+
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path, _ = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+
+    with csv_path.open(encoding="utf-8-sig") as f:
+        first = next(csv.DictReader(f))
+    assert first["発行元の根拠"].startswith("text")
+    assert "issuer_source=" not in first["備考"]
+    log_text = (
+        config.folder_path(root, config.LOGS) / f"操作ログ_{FIXED_WHEN:%Y%m%d}.csv"
+    ).read_text(encoding="utf-8-sig")
+    assert "発行元推定" not in log_text
+
+
+def test_old_proposal_csv_without_new_column_is_still_applicable(root: Path):
+    """`発行元の根拠` 列を持たない古い変更案CSVでも apply が通ること
+    （列を後ろへ追記しただけなので、既に `_変更案` に残っているCSVを壊さない）。"""
+    src = _put_inbox_file(root, "old.pdf")
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000000.csv"
+    old_columns = [c for c in CSV_COLUMNS if c != "発行元の根拠"]
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=old_columns)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "元ファイル名": src.name,
+                "元ファイルパス": str(src),
+                "提案カテゴリ": config.CATEGORY_TAX,
+                "提案新ファイル名": "20260810_納税証明書_麹町税務署.pdf",
+                "書類種別(判定)": "納税証明書",
+                "発行元(判定)": "麹町税務署",
+                "書類日付(判定)": "2026-08-10",
+                "確信度": "高",
+                "承認": "OK",
+                "備考": "",
+            }
+        )
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+    assert len(results) == 1 and results[0].ok
+    assert (root / config.CATEGORY_TAX / "20260810_納税証明書_麹町税務署.pdf").exists()
+
+
+def _write_rows_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _approved_row(src: Path, filename: str) -> dict[str, str]:
+    return {
+        "元ファイル名": src.name,
+        "元ファイルパス": str(src),
+        "提案カテゴリ": config.CATEGORY_TAX,
+        "提案新ファイル名": filename,
+        "書類種別(判定)": "納税証明書",
+        "発行元(判定)": "麹町税務署",
+        "書類日付(判定)": "2026-08-10",
+        "確信度": "高",
+        "承認": "OK",
+        "備考": "",
+    }
+
+
+def test_apply_tolerates_rows_with_missing_trailing_cell(root: Path):
+    """ヘッダーは新11列だがデータ行が10セルしかないCSV（Excel/Numbersや手修正で起きる）でも、
+    コピー後に落ちずバッチの全行が処理されること。
+
+    `csv.DictReader` は足りないセルを None で埋めるため、素の文字列操作をすると
+    `safe_copy` 成功後・受信箱削除前に AttributeError で止まり、残り全行が未処理のまま
+    次回のauto-runで再処理（連番コピー）される事故になる。
+    """
+    src1 = _put_inbox_file(root, "a.pdf")
+    src2 = _put_inbox_file(root, "b.pdf")
+    archive_inbox(root, when=FIXED_WHEN)  # 複製済みでないと安全弁で元ファイルを消さないため
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000000.csv"
+    # ヘッダーは11列、各行は末尾セル（発行元の根拠）が欠けた10セル
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_COLUMNS)
+        for src, name in ((src1, "20260810_納税証明書_麹町税務署.pdf"), (src2, "20260811_納税証明書_麹町税務署.pdf")):
+            row = _approved_row(src, name)
+            writer.writerow([row[c] for c in CSV_COLUMNS if c != "発行元の根拠"])
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+    assert len(results) == 2
+    assert all(r.ok for r in results)
+    assert all(r.deleted_source for r in results)
+
+
+def test_apply_rejects_duplicated_control_column(root: Path):
+    """重複列を拒否する。`csv.DictReader` は同名列の**後ろ**の値を採るため、見た目の
+    「承認」が空欄でも末尾に重複した「承認=OK」があれば実行されてしまう。"""
+    src = _put_inbox_file(root, "a.pdf")
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000001.csv"
+    row = _approved_row(src, "20260810_納税証明書_麹町税務署.pdf")
+    row["承認"] = ""
+    with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow([*CSV_COLUMNS, "承認"])
+        writer.writerow([*[row.get(c, "") for c in CSV_COLUMNS], "OK"])
+
+    with pytest.raises(ValueError, match="重複"):
+        apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+    assert src.exists()  # 1行も実行されていない
+
+
+def test_apply_rejects_column_inserted_before_required_columns(root: Path):
+    """必須列の前・途中への列挿入や列順の入れ替えは拒否する（列位置で安全弁を張るため）。"""
+    src = _put_inbox_file(root, "a.pdf")
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000002.csv"
+    row = _approved_row(src, "20260810_納税証明書_麹町税務署.pdf")
+    _write_rows_csv(csv_path, ["メモ", *CSV_COLUMNS], [{"メモ": "x", **row}])
+
+    with pytest.raises(ValueError, match="列構成が不正"):
+        apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+
+def test_apply_allows_extra_trailing_column(root: Path):
+    """末尾に見知らぬ列が増えるのは許す（表計算ソフトが空列を足すことがある）。"""
+    src = _put_inbox_file(root, "a.pdf")
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000003.csv"
+    row = _approved_row(src, "20260810_納税証明書_麹町税務署.pdf")
+    _write_rows_csv(csv_path, [*CSV_COLUMNS, "メモ"], [{**row, "メモ": "手書き"}])
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+    assert len(results) == 1 and results[0].ok
+
+
+def test_fallback_log_failure_does_not_stop_proposal(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """推定の監査ログ書き込みが失敗しても、変更案の生成自体は止めないこと
+    （給与の推定行だけが新しい停止経路になり、同じバッチの他カテゴリまで巻き込むのを防ぐ）。"""
+    _put_inbox_file(root, "202601月給与.pdf")
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: "")
+
+    from home_doc_organizer import logger as logger_mod
+
+    real_log = logger_mod.log_operation
+
+    def flaky(root_, operation, *args, **kwargs):
+        if operation == logger_mod.OP_ISSUER_FALLBACK:
+            raise OSError("disk full")
+        return real_log(root_, operation, *args, **kwargs)
+
+    monkeypatch.setattr("home_doc_organizer.proposal.logger.log_operation", flaky)
+
+    csv_path, rows = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+
+    assert len(rows) == 1
+    assert rows[0].issuer == "株式会社エフティグループ"
+    assert csv_path.exists()
+
+
+def test_classification_result_positional_and_replace_compat():
+    """`issuer_source` を末尾に足しただけなので、位置引数での生成も `replace` も壊れないこと。"""
+    from dataclasses import replace
+
+    result = classify.ClassificationResult(
+        "税金",
+        config.CATEGORY_TAX,
+        "納税証明書",
+        "麹町税務署",
+        "20260810",
+        False,
+        "高",
+        "テスト",
+    )
+    assert result.issuer_source == classify.ISSUER_SOURCE_UNKNOWN  # 根拠は推測で埋めない
+
+    fallback = replace(result, issuer_source=classify.ISSUER_SOURCE_FALLBACK)
+    assert replace(fallback, doc_type="別種別").issuer_source == classify.ISSUER_SOURCE_FALLBACK
+
+
+def test_apply_continues_when_success_log_write_fails(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """コピー成功後のログ書き込みが失敗しても、受信箱削除と残りの行の処理を続けること。
+
+    ここで例外が漏れると「コピー済みなのに元ファイルが残り、残りの行は未処理」となり、
+    次回のauto-runが同じファイルを再処理して連番コピー（_2）を作る事故になる。
+    """
+    src1 = _put_inbox_file(root, "a.pdf")
+    src2 = _put_inbox_file(root, "b.pdf")
+    archive_inbox(root, when=FIXED_WHEN)
+    csv_path = config.folder_path(root, config.PROPOSALS) / "変更案_20260817_000004.csv"
+    _write_rows_csv(
+        csv_path,
+        CSV_COLUMNS,
+        [
+            _approved_row(src1, "20260810_納税証明書_麹町税務署.pdf"),
+            _approved_row(src2, "20260811_納税証明書_麹町税務署.pdf"),
+        ],
+    )
+
+    from home_doc_organizer import logger as logger_mod
+
+    real_log = logger_mod.log_operation
+
+    def flaky(root_, operation, *args, **kwargs):
+        if operation == logger_mod.OP_RENAME_EXEC:
+            raise OSError("disk full")
+        return real_log(root_, operation, *args, **kwargs)
+
+    monkeypatch.setattr("home_doc_organizer.apply_changes.logger.log_operation", flaky)
+
+    results = apply_approved_changes(root, csv_path=csv_path, when=FIXED_WHEN)
+
+    assert len(results) == 2
+    assert all(r.ok and r.deleted_source for r in results)
+    assert not src1.exists() and not src2.exists()
+
+
+def test_employment_table_is_read_once_per_batch(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """在籍期間表はバッチ開始時に1回だけ読む（処理中に設定が書き換わっても
+    同じバッチの前半と後半で発行元の判定が変わらない・iCloudのreadを繰り返さない）。"""
+    for name in ("202601月給与.pdf", "202602月給与.pdf", "202603月給与.pdf"):
+        _put_inbox_file(root, name)
+    monkeypatch.setattr("home_doc_organizer.extract.extract_text", lambda path: "")
+
+    calls: list[object] = []
+    real = config.load_employment_periods
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("home_doc_organizer.proposal.config.load_employment_periods", counting)
+    monkeypatch.setattr("home_doc_organizer.classify.config.load_employment_periods", counting)
+
+    _, rows = generate_proposal_csv(root, when=FIXED_WHEN, auto_approve=True)
+
+    assert len(rows) == 3
+    assert all(r.issuer == "株式会社エフティグループ" for r in rows)
+    assert len(calls) == 1

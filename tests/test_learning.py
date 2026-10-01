@@ -92,3 +92,38 @@ def test_learn_from_applied_row_saves_valid_rule(tmp_path: Path):
         "doc_type": "クレジットカード",
         "issuer": "dカード",
     }
+
+
+def test_learn_skips_rows_whose_issuer_was_inferred(tmp_path: Path):
+    """推定で埋めた発行元（在籍期間照合）は学習しない（T-1230）。
+
+    推定値を学習すると、次回以降は「学習済みルールに一致・確信度高」として扱われ、
+    推定だったことが消えてしまう。本文に実在するかどうかに頼らず、根拠の列で弾く。
+    """
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    row = {
+        "提案カテゴリ": config.CATEGORY_PAYROLL,
+        "書類種別(判定)": "給与明細",
+        "発行元(判定)": "株式会社エフティグループ",
+        "発行元の根拠": "fallback（在籍期間照合による推定・読み取り値ではない）",
+    }
+    # 本文に社名が実在していても（＝従来の条件は通る）学習しない
+    learning.learn_from_applied_row(root, row, "株式会社エフティグループ 給与明細書")
+
+    assert learning.load_rules(root) == []
+
+
+def test_learn_still_works_for_issuer_read_from_text(tmp_path: Path):
+    """読み取り値（text）の行は従来どおり学習する（リグレッション防止）。"""
+    root = tmp_path / "書類整理ルート"
+    init_folders(root)
+    row = {
+        "提案カテゴリ": config.CATEGORY_PAYROLL,
+        "書類種別(判定)": "給与明細",
+        "発行元(判定)": "株式会社エフティグループ",
+        "発行元の根拠": "text（本文からの読み取り値）",
+    }
+    learning.learn_from_applied_row(root, row, "株式会社エフティグループ 給与明細書")
+
+    assert [r["keyword"] for r in learning.load_rules(root)] == ["株式会社エフティグループ"]
